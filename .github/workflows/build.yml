@@ -146,10 +146,28 @@ jobs:
           tar -czf "$GITHUB_WORKSPACE/ue4ss-linux-palworld-${{ needs.check.outputs.tag }}.tar.gz" .
           ls -la "$GITHUB_WORKSPACE"/*.tar.gz
 
+      - name: Conserver l'archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive
+          path: ue4ss-linux-palworld-*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  # gh n'existe que sur les runners GitHub, pas dans le conteneur gcc:13 qui
+  # sert au build : la publication se fait donc depuis un job separe.
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: archive
+
       - name: Publier la release
         run: |
           gh release create "${{ needs.check.outputs.tag }}" \
-            "$GITHUB_WORKSPACE/ue4ss-linux-palworld-${{ needs.check.outputs.tag }}.tar.gz" \
+            ue4ss-linux-palworld-*.tar.gz \
             --repo "$GITHUB_REPOSITORY" \
             --title "linux-native ${{ needs.check.outputs.short }}" \
             --notes "Build automatique de \`$UPSTREAM@${{ needs.check.outputs.sha }}\`.
