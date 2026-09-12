@@ -1,0 +1,161 @@
+name: Build UE4SS Linux (Palworld)
+
+# Suit la branche linux-native de l'amont. Un build par nouveau commit amont :
+# le job de veille compare le SHA amont au dernier tag publie ici et s'arrete
+# s'il n'y a rien de neuf, pour ne pas empiler des releases identiques.
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Reconstruire meme si le commit amont est deja publie'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: BlackBookOfficial/ue4ss-linux-palworld
+  UPSTREAM_BRANCH: linux-native
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.up.outputs.sha }}
+      short: ${{ steps.up.outputs.short }}
+      tag: ${{ steps.up.outputs.tag }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - id: up
+        name: Resoudre le HEAD amont
+        run: |
+          SHA=$(gh api "repos/$UPSTREAM/commits/$UPSTREAM_BRANCH" --jq .sha)
+          echo "sha=$SHA"                >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:8}"        >> "$GITHUB_OUTPUT"
+          echo "tag=linux-native-${SHA:0:8}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - id: decide
+        name: Deja publie ?
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if gh release view "${{ steps.up.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Commit amont deja publie, rien a faire."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    # Debian 12 + GCC 13 : plancher glibc 2.36, contrairement au build amont
+    # produit sur Ubuntu 24.04 qui exige glibc 2.38 (issue amont #16).
+    container: gcc:13
+    steps:
+      - name: Dependances de build
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            cmake ninja-build pkg-config git ca-certificates curl \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl-dev libegl-dev libgles-dev binutils zip xz-utils
+
+      - name: Cloner l'amont
+        run: |
+          git clone --branch "$UPSTREAM_BRANCH" --recursive \
+            "https://github.com/$UPSTREAM.git" src
+          cd src && git checkout --detach "${{ needs.check.outputs.sha }}"
+          git submodule update --init --recursive
+
+      - name: Rust (requis par la chaine de build amont)
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Configurer
+        working-directory: src
+        run: |
+          cmake -B build_linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Game__Dev__Linux64 \
+            -DUE4SS_GUI_ENABLED=ON \
+            -DUE4SS_INPUT_ENABLED=OFF \
+            -DUE4SS_PROFILERS=OFF \
+            -DCMAKE_CXX_FLAGS="-static-libstdc++ -static-libgcc" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+            -Wno-dev
+
+      - name: Compiler
+        working-directory: src
+        run: cmake --build build_linux --target UE4SS
+
+      - name: Verifier le plancher glibc
+        working-directory: src
+        run: |
+          SO=build_linux/Game__Dev__Linux64/lib/libUE4SS.so
+          if objdump -p "$SO" | grep -q "libstdc++"; then
+            echo "::error::libstdc++ est liee dynamiquement, le binaire ne tournera pas sur Debian 12"
+            exit 1
+          fi
+          MAX=$(objdump -p "$SO" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+          echo "Version glibc maximale requise : $MAX"
+          case "$MAX" in
+            GLIBC_2.3[0-6]|GLIBC_2.2*|GLIBC_2.1*) ;;
+            *) echo "::error::$MAX depasse le plancher glibc 2.36 vise"; exit 1 ;;
+          esac
+
+      - name: Assembler l'archive
+        working-directory: src
+        run: |
+          OUT="$GITHUB_WORKSPACE/pkg"
+          mkdir -p "$OUT"
+          cp build_linux/Game__Dev__Linux64/lib/libUE4SS.so "$OUT/"
+          strip --strip-debug "$OUT/libUE4SS.so"
+          cp assets/UE4SS-settings.ini "$OUT/"
+          cp assets/palworld/MemberVariableLayout.ini "$OUT/"
+          cp -r assets/Mods "$OUT/"
+
+          # Serveur dedie headless : ni display ni GPU pour la GUI de debug, et les
+          # mods integres orientes client supposent un joueur local (issue amont #13).
+          sed -i -E 's/^[[:space:]]*GuiConsoleEnabled[[:space:]]*=.*/GuiConsoleEnabled = 0/; s/^[[:space:]]*GuiConsoleVisible[[:space:]]*=.*/GuiConsoleVisible = 0/' "$OUT/UE4SS-settings.ini"
+          for m in CheatManagerEnablerMod ConsoleCommandsMod ConsoleEnablerMod LineTraceMod SplitScreenMod jsbLuaProfilerMod ActorDumperMod Keybinds; do
+            sed -i -E "s/^(\xEF\xBB\xBF)?[[:space:]]*${m}[[:space:]]*:[[:space:]]*1[[:space:]]*$/\1${m} : 0/" "$OUT/Mods/mods.txt"
+          done
+
+          {
+            echo "UE4SS Linux Native - build Arkya"
+            echo "================================"
+            echo "Amont      : $UPSTREAM@$UPSTREAM_BRANCH"
+            echo "Commit     : ${{ needs.check.outputs.sha }}"
+            echo "Compilateur: $(gcc --version | head -1)"
+            echo "Base       : $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "glibc      : $(ldd --version | head -1)"
+            echo "Date       : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          } > "$OUT/BUILD_INFO.txt"
+
+          cd "$OUT"
+          tar -czf "$GITHUB_WORKSPACE/ue4ss-linux-palworld-${{ needs.check.outputs.tag }}.tar.gz" .
+          ls -la "$GITHUB_WORKSPACE"/*.tar.gz
+
+      - name: Publier la release
+        run: |
+          gh release create "${{ needs.check.outputs.tag }}" \
+            "$GITHUB_WORKSPACE/ue4ss-linux-palworld-${{ needs.check.outputs.tag }}.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "linux-native ${{ needs.check.outputs.short }}" \
+            --notes "Build automatique de \`$UPSTREAM@${{ needs.check.outputs.sha }}\`.
+
+          Compilé avec GCC 13 sur Debian 12 et \`-static-libstdc++\`, donc utilisable dès glibc 2.36 (le build amont exige 2.38).
+
+          Console de debug désactivée et mods orientés client mis à 0 pour un serveur dédié headless."
+        env:
+          GH_TOKEN: ${{ github.token }}
